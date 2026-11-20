@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Eye Check</title>
+<style>
+/* Eye Check v1 — X357-AI · Barry Lee Guevremont
+   Diagnostic: shows exactly what the phone sees — your face, the eye-corner and eyelid points, and the iris
+   centres it finds — plus live numbers, so "eyes found" can be checked with your own eyes, not taken on trust. */
+:root{--bg:#050a08;--g1:#7dffb0;--g2:#3ea874;--amber:#ffc861;--red:#ff4d4d}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:#d8ffe8;font:15px/1.4 system-ui,-apple-system,Roboto,sans-serif}
+main{max-width:520px;margin:0 auto;padding:12px 12px 24px}
+h1{font-size:24px;margin:4px 0 8px;color:var(--g1)}
+#view{position:relative;width:100%;aspect-ratio:3/4;background:#000;border-radius:14px;overflow:hidden;border:3px solid #1d5a3e}
+#view video,#view canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
+#lock{display:flex;align-items:center;gap:12px;margin:12px 0;font-size:18px;font-weight:600}
+#lamp{width:28px;height:28px;border-radius:50%;background:#333;box-shadow:0 0 0 2px #0003}
+table{width:100%;border-collapse:collapse;font-size:14px}
+td{padding:5px 4px;border-bottom:1px solid #12301f}
+td:last-child{text-align:right;font-variant-numeric:tabular-nums;color:var(--g1)}
+button{font:inherit;font-size:17px;min-height:48px;padding:10px 22px;border-radius:24px;border:1px solid var(--g2);
+  background:#0c1f16;color:var(--g1);width:100%;margin:8px 0}
+small{color:var(--g2)}
+pre{white-space:pre-wrap;font-size:12px;background:#08140e;padding:8px;border-radius:8px;color:#a9d9bd}
+</style>
+</head>
+<body>
+<main>
+  <h1>Eye Check</h1>
+  <small>See what the camera sees. Green dots = eye corners, small dots = eyelids, rings = the irises it found.</small>
+  <button id="bStart">Start camera</button>
+  <div id="view"><video id="cam" playsinline muted></video><canvas id="ov"></canvas></div>
+  <div id="lock"><span id="lamp"></span><span id="lockTxt">Not started</span></div>
+  <table>
+    <tr><td>Model running on</td><td id="tDel">–</td></tr>
+    <tr><td>Camera size</td><td id="tCam">–</td></tr>
+    <tr><td>Frames analysed per second</td><td id="tFps">–</td></tr>
+    <tr><td>Face found</td><td id="tFace">–</td></tr>
+    <tr><td>Eye openness L / R (need ≥ 0.12)</td><td id="tOpen">–</td></tr>
+    <tr><td>Iris position across / up-down</td><td id="tUV">–</td></tr>
+    <tr><td>Jitter (lock needs below 0.050)</td><td id="tJit">–</td></tr>
+    <tr><td>Blinks counted</td><td id="tBl">0</td></tr>
+  </table>
+  <p><small>Try it: look left and right — "iris position across" should change. Close your eyes — openness should drop below 0.12 and the blink count go up. Hold still — jitter should drop and the lamp turn green.</small></p>
+  <button id="bCopy">Copy a snapshot of these numbers</button>
+  <pre id="out"></pre>
+</main>
+<script type="module">
+{
+const MP = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+const MODEL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+const $ = id => document.getElementById(id);
+const vid = $("cam"), ov = $("ov"), ctx = ov.getContext("2d");
+let lm = null, delegate = "–", lastVT = -1, frames = 0, fpsT = 0, blinks = 0, closed = false;
+const HIST = [], TOL = 0.05;
+function eyeFeat(L, outer, inner, up, lo, iris){
+  const a = L[inner], b = L[outer], c = L[iris];
+  const ex = b.x-a.x, ey = b.y-a.y, w2 = ex*ex+ey*ey, w = Math.sqrt(w2);
+  return { u: ((c.x-a.x)*ex + (c.y-a.y)*ey)/w2, v: ((c.x-a.x)*(-ey) + (c.y-a.y)*ex)/w2,
+           open: Math.hypot(L[up].x-L[lo].x, L[up].y-L[lo].y)/w };
+}
+async function boot(){
+  $("lockTxt").textContent = "Loading face model…";
+  const { FaceLandmarker, FilesetResolver } = await import(MP + "/vision_bundle.mjs");
+  const files = await FilesetResolver.forVisionTasks(MP + "/wasm");
+  const mk = d => FaceLandmarker.createFromOptions(files, { baseOptions:{ modelAssetPath: MODEL, delegate: d }, runningMode:"VIDEO", numFaces:1 });
+  try { lm = await mk("GPU"); delegate = "GPU"; } catch(e){ lm = await mk("CPU"); delegate = "CPU"; }
+  $("tDel").textContent = delegate;
+  $("lockTxt").textContent = "Starting camera…";
+  const s = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:"user", width:{ideal:640}, height:{ideal:480} }, audio:false });
+  vid.srcObject = s; await vid.play();
+  ov.width = vid.videoWidth; ov.height = vid.videoHeight;
+  $("tCam").textContent = `${vid.videoWidth} × ${vid.videoHeight}`;
+  requestAnimationFrame(loop);
+}
+function dot(p, r, col, fill=true){ ctx.beginPath(); ctx.arc(p.x*ov.width, p.y*ov.height, r, 0, 7);
+  if (fill){ ctx.fillStyle = col; ctx.fill(); } else { ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.stroke(); } }
+function loop(now){
+  if (vid.readyState >= 2 && vid.currentTime !== lastVT){
+    lastVT = vid.currentTime; frames++;
+    const res = lm.detectForVideo(vid, now);
+    ctx.clearRect(0, 0, ov.width, ov.height);
+    const face = res.faceLandmarks && res.faceLandmarks.length && res.faceLandmarks[0].length >= 478;
+    $("tFace").textContent = face ? "yes" : "NO";
+    let state = 0;
+    if (face){
+      const L = res.faceLandmarks[0];
+      for (const i of [33,133,263,362]) dot(L[i], 4, "#7dffb0");
+      for (const i of [159,145,386,374]) dot(L[i], 2.5, "#a9d9bd");
+      const r = eyeFeat(L,33,133,159,145,468), l = eyeFeat(L,263,362,386,374,473);
+      const irisR = Math.hypot(L[469].x-L[471].x, L[469].y-L[471].y)/2*ov.width || 4;
+      const open = Math.min(r.open, l.open) >= 0.12;
+      for (const i of [468,473]) dot(L[i], Math.max(4, irisR), open ? "#ff4d4d" : "#ffffff", false);
+      for (const i of [468,473]) dot(L[i], 2.5, open ? "#ff4d4d" : "#ffffff");
+      $("tOpen").textContent = `${l.open.toFixed(2)} / ${r.open.toFixed(2)}`;
+      if (!open){ closed = true; HIST.length = 0; state = 3; $("tUV").textContent = "eyes closed"; $("tJit").textContent = "–"; }
+      else {
+        if (closed){ blinks++; $("tBl").textContent = blinks; closed = false; }
+        const u = (r.u+l.u)/2, v = (r.v+l.v)/2;
+        $("tUV").textContent = `${u.toFixed(3)} / ${v.toFixed(3)}`;
+        HIST.push([u,v]); if (HIST.length > 8) HIST.shift();
+        if (HIST.length >= 6){
+          const sd = j => { const m = HIST.reduce((a,h)=>a+h[j],0)/HIST.length; return Math.sqrt(HIST.reduce((a,h)=>a+(h[j]-m)**2,0)/HIST.length); };
+          const jit = Math.max(sd(0), sd(1)); $("tJit").textContent = jit.toFixed(3);
+          state = jit < TOL ? 2 : 1;
+        } else state = 1;
+      }
+    } else { HIST.length = 0; $("tOpen").textContent = "–"; $("tUV").textContent = "–"; $("tJit").textContent = "–"; }
+    const look = [["#ff4d4d","No face — more light, face the camera"],["#ffc861","Eyes found — moving"],["#7dffb0","LOCKED — eyes steady"],["#ffffff","Blink / eyes closed"]][state];
+    $("lamp").style.background = look[0]; $("lamp").style.boxShadow = state === 2 ? "0 0 18px #7dffb0" : "none";
+    $("lockTxt").textContent = look[1]; $("lockTxt").style.color = look[0]; $("view").style.borderColor = look[0];
+  }
+  if (now - fpsT > 1000){ $("tFps").textContent = frames; frames = 0; fpsT = now; }
+  requestAnimationFrame(loop);
+}
+$("bStart").onclick = async () => { $("bStart").disabled = true;
+  try { await boot(); $("bStart").style.display = "none"; }
+  catch(e){ $("lockTxt").textContent = "Could not start: " + (e && e.message || e); $("bStart").disabled = false; } };
+$("bCopy").onclick = async () => {
+  const snap = ["tDel","tCam","tFps","tFace","tOpen","tUV","tJit","tBl"].map(id => `${id.slice(1)}: ${$(id).textContent}`).join("\n")
+    + `\nstate: ${$("lockTxt").textContent}\nua: ${navigator.userAgent}`;
+  $("out").textContent = snap;
+  try { await navigator.clipboard.writeText(snap); } catch(e){}
+};
+}
+</script>
+</body>
+</html>

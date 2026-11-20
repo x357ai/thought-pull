@@ -38,7 +38,7 @@ pre#log{max-height:30vh;overflow:auto;text-align:left;font-size:12px;background:
 </head>
 <body>
 <canvas id="stage"></canvas>
-<video id="cam" playsinline muted style="display:none"></video>
+<video id="cam" playsinline muted style="position:fixed;top:0;left:0;width:4px;height:4px;opacity:.01;pointer-events:none"></video>
 <div id="hud"><span>Locks <b id="hLocks">0</b></span><span>Moves <b id="hMoves">0</b></span><span>Blinks <b id="hBlinks">0</b></span><span>Learned <b id="hLearn">0</b></span></div>
 <button id="menuBtn">Menu</button>
 
@@ -71,6 +71,8 @@ pre#log{max-height:30vh;overflow:auto;text-align:left;font-size:12px;background:
 
 <script type="module">
 {
+// v1.4: camera <video> is never display:none -- a hidden video can stop delivering new frames on Android
+// Chrome, which freezes the eye readings (eyes 'found' but never steady). Suspected cause of Barry's stuck dot.
 const MP = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
 const MODEL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
 const $ = id => document.getElementById(id);

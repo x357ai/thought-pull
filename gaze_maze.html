@@ -17,7 +17,8 @@ canvas#stage{position:fixed;inset:0;width:100vw;height:100vh;display:block}
   display:flex;gap:14px;justify-content:space-between;font-size:14px;color:var(--g2);pointer-events:none;background:rgba(5,10,8,.92)}
 #hud b{color:var(--g1);font-weight:600}
 #cam{position:fixed;top:10px;right:10px;width:72px;height:96px;object-fit:cover;border-radius:10px;
-  border:1px solid var(--g3);transform:scaleX(-1);opacity:.55;display:none}
+  border:1px solid var(--g3);transform:scaleX(-1);opacity:.55}
+#cam.tiny{width:4px;height:4px;opacity:.01;pointer-events:none;border:0}
 .panel{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
   gap:14px;padding:28px;text-align:center;background:rgba(5,10,8,.94)}
 .panel h1{margin:0;font-size:34px;line-height:1.05;color:var(--g1)}
@@ -38,7 +39,7 @@ pre#log{max-height:30vh;overflow:auto;text-align:left;font-size:12px;background:
 </head>
 <body>
 <canvas id="stage"></canvas>
-<video id="cam" playsinline muted></video>
+<video id="cam" class="tiny" playsinline muted></video>
 <div id="hud"><span>Maze <b id="hLevel">1</b></span><span>Steps <b id="hSteps">0</b> / best <b id="hBest">–</b></span><span><b id="hTime">0.0</b> s</span><span id="hAcc"></span></div>
 <button id="menuBtn">Menu</button>
 
@@ -71,6 +72,8 @@ pre#log{max-height:30vh;overflow:auto;text-align:left;font-size:12px;background:
 
 <script type="module">
 {
+// v1.4: camera <video> is never display:none -- a hidden video can stop delivering new frames on Android
+// Chrome, which freezes the eye readings (eyes 'found' but never steady). Suspected cause of Barry's stuck dot.
 const MP = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
 const MODEL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
 const $ = id => document.getElementById(id);
@@ -300,7 +303,7 @@ $("bStart").onclick = async () => {
   try { audio = audio || new (window.AudioContext || window.webkitAudioContext)(); } catch(e){}
   try { if (!landmarker) await boot(); }
   catch(e){ status("Could not start camera/model: " + (e && e.message || e) + ". Open from an https address in Chrome and allow the camera."); $("bStart").disabled = false; return; }
-  vid.style.display = opt.cam ? "block" : "none"; $("menuBtn").style.display = "block"; $("pStart").classList.add("hidden"); startCal();
+  vid.classList.toggle("tiny", !opt.cam); $("menuBtn").style.display = "block"; $("pStart").classList.add("hidden"); startCal();
 };
 $("menuBtn").onclick = () => { if (mode === "play") mode = "paused"; $("pMenu").classList.remove("hidden"); $("log").textContent = LOG.join("\n"); };
 $("bResume").onclick = () => { $("pMenu").classList.add("hidden"); if (mapX){ mode = "play"; startT = performance.now() - 1000*parseFloat($("hTime").textContent); } else startCal(); };
