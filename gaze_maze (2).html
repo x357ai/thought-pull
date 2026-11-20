@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Gaze Maze</title>
+<style>
+/* Gaze Maze v1 — X357-AI · Barry Lee Guevremont
+   Steer a glowing runner through a maze with your eyes.
+   Look toward an edge arrow and hold: the runner steps that way. Look at the centre to stop. */
+:root{--bg:#050a08;--ink:#d8ffe8;--g1:#7dffb0;--g2:#3ea874;--g3:#1d5a3e;--bad:#ff6b5a}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);
+  font:16px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;overflow:hidden;touch-action:none}
+canvas#stage{position:fixed;inset:0;width:100vw;height:100vh;display:block}
+#hud{position:fixed;left:0;right:0;bottom:0;padding:10px 14px calc(10px + env(safe-area-inset-bottom));
+  display:flex;gap:14px;justify-content:space-between;font-size:14px;color:var(--g2);pointer-events:none;background:rgba(5,10,8,.92)}
+#hud b{color:var(--g1);font-weight:600}
+#cam{position:fixed;top:10px;right:10px;width:72px;height:96px;object-fit:cover;border-radius:10px;
+  border:1px solid var(--g3);transform:scaleX(-1);opacity:.55;display:none}
+.panel{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:14px;padding:28px;text-align:center;background:rgba(5,10,8,.94)}
+.panel h1{margin:0;font-size:34px;line-height:1.05;color:var(--g1)}
+.panel p{margin:0;max-width:34em;color:#a9d9bd}
+.panel small{color:var(--g2);max-width:34em}
+button{font:inherit;font-size:17px;min-height:48px;padding:10px 22px;border-radius:24px;border:1px solid var(--g2);
+  background:#0c1f16;color:var(--g1);cursor:pointer}
+button:focus-visible{outline:2px solid var(--g1);outline-offset:3px}
+.row{display:flex;gap:12px;flex-wrap:wrap;justify-content:center}
+label{display:flex;gap:8px;align-items:center;color:#a9d9bd;font-size:15px}
+input[type=checkbox]{width:22px;height:22px;accent-color:var(--g1)}
+select{font:inherit;font-size:16px;min-height:44px;background:#0c1f16;color:var(--g1);border:1px solid var(--g2);border-radius:10px;padding:6px 10px}
+#menuBtn{position:fixed;top:10px;left:10px;min-height:40px;padding:6px 14px;font-size:14px;opacity:.7;display:none}
+pre#log{max-height:30vh;overflow:auto;text-align:left;font-size:12px;background:#08140e;padding:10px;border-radius:8px;
+  width:min(92vw,520px);color:#a9d9bd;white-space:pre-wrap}
+.hidden{display:none!important}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<video id="cam" playsinline muted></video>
+<div id="hud"><span>Maze <b id="hLevel">1</b></span><span>Steps <b id="hSteps">0</b> / best <b id="hBest">–</b></span><span><b id="hTime">0.0</b> s</span><span id="hAcc"></span></div>
+<button id="menuBtn">Menu</button>
+
+<div class="panel" id="pStart">
+  <h1>Gaze Maze</h1>
+  <p>Guide the runner to the glowing exit using only your eyes. Look toward an <b>arrow at the edge</b> and hold:
+     the runner steps that way. Look at the <b>middle</b> of the screen to stop.</p>
+  <div class="row">
+    <label>Step speed
+      <select id="optSpeed"><option value="600">Calm</option><option value="420" selected>Normal</option><option value="300">Fast</option></select></label>
+    <label><input type="checkbox" id="optLight" checked> Screen light (for dim rooms)</label>
+    <label><input type="checkbox" id="optDot"> Show gaze dot</label>
+    <label><input type="checkbox" id="optCam"> Show camera</label>
+  </div>
+  <button id="bStart">Start — calibrate (about 20 s)</button>
+  <small id="status">Camera-based eye tracking (MediaPipe iris landmarks). Nothing leaves the phone.</small>
+</div>
+
+<div class="panel hidden" id="pMenu">
+  <h1>Session</h1>
+  <pre id="log"></pre>
+  <div class="row">
+    <button id="bResume">Resume</button>
+    <button id="bRecal">Recalibrate</button>
+    <button id="bSkip">New maze</button>
+    <button id="bCopy">Copy log (CSV)</button>
+  </div>
+  <small id="copyMsg"></small>
+</div>
+
+<script type="module">
+{
+const MP = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+const MODEL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+const $ = id => document.getElementById(id);
+const cv = $("stage"), ctx = cv.getContext("2d"), vid = $("cam");
+let W = 0, H = 0, DPR = 1, CX = 0, CY = 0, M = 0;
+function resize(){ DPR = Math.min(devicePixelRatio || 1, 2); W = innerWidth; H = innerHeight;
+  cv.width = W*DPR; cv.height = H*DPR; ctx.setTransform(DPR,0,0,DPR,0,0); CX = W/2; CY = H*0.47; M = Math.min(W,H); }
+addEventListener("resize", resize); resize();
+const status = msg => { $("status").textContent = msg; };
+const opt = { speed:420, dot:false, cam:false, light:true };
+let landmarker = null, audio = null;
+
+// ---------------------------------------------------------------- gaze features (same engine as Thought Pull)
+function eyeFeat(L, outer, inner, up, lo, iris){
+  const a = L[inner], b = L[outer], c = L[iris];
+  const ex = b.x - a.x, ey = b.y - a.y, w2 = ex*ex + ey*ey, w = Math.sqrt(w2);
+  const u = ((c.x-a.x)*ex + (c.y-a.y)*ey) / w2;
+  const v = ((c.x-a.x)*(-ey) + (c.y-a.y)*ex) / w2;
+  const open = Math.hypot(L[up].x-L[lo].x, L[up].y-L[lo].y) / w;
+  return { u, v, open };
+}
+function features(res){
+  if (!res.faceLandmarks || !res.faceLandmarks.length) return null;
+  const L = res.faceLandmarks[0]; if (L.length < 478) return null;
+  const r = eyeFeat(L, 33, 133, 159, 145, 468), l = eyeFeat(L, 263, 362, 386, 374, 473);
+  if (Math.min(r.open, l.open) < 0.12) return null;
+  let yaw = 0, pitch = 0; const T = res.facialTransformationMatrixes && res.facialTransformationMatrixes[0];
+  if (T && T.data){ yaw = T.data[8]; pitch = T.data[9]; }
+  return [1, r.u, r.v, l.u, l.v, yaw, pitch];
+}
+function solve(A, b){ const n = b.length; A = A.map((r,i)=>[...r, b[i]]);
+  for (let i=0;i<n;i++){ let p=i; for (let k=i+1;k<n;k++) if (Math.abs(A[k][i])>Math.abs(A[p][i])) p=k;
+    [A[i],A[p]]=[A[p],A[i]]; const d=A[i][i]||1e-12;
+    for (let k=0;k<n;k++){ if(k===i) continue; const f=A[k][i]/d; for(let j=i;j<=n;j++) A[k][j]-=f*A[i][j]; } }
+  return A.map((r,i)=>r[n]/(r[i]||1e-12)); }
+function fitRidge(X, Y, lam=1e-3){ const d = X[0].length; const mu = Array(d).fill(0), sd = Array(d).fill(1);
+  for (let j=1;j<d;j++){ mu[j] = X.reduce((s,x)=>s+x[j],0)/X.length;
+    sd[j] = Math.sqrt(X.reduce((s,x)=>s+(x[j]-mu[j])**2,0)/X.length) || 1; }
+  const Z = X.map(x=>x.map((v,j)=> j? (v-mu[j])/sd[j] : 1));
+  const XtX = Array.from({length:d},(_,i)=>Array.from({length:d},(_,j)=>Z.reduce((s,z)=>s+z[i]*z[j],0)+(i===j&&i?lam*Z.length:0)));
+  const Xty = Array.from({length:d},(_,i)=>Z.reduce((s,z,k)=>s+z[i]*Y[k],0));
+  const w = solve(XtX, Xty);
+  return x => x.reduce((s,v,j)=> s + w[j]*(j? (v-mu[j])/sd[j] : 1), 0); }
+function oneEuro(minCut=1.0, beta=0.02, dCut=1.0){ let x=null, dx=0, t=null; const a=(c,dt)=>1/(1+1/(2*Math.PI*c*dt));
+  return (v, now)=>{ if (x===null){ x=v; t=now; return v; } const dt=Math.max((now-t)/1000,1e-3); t=now;
+    const d=(v-x)/dt; dx+=a(dCut,dt)*(d-dx); const c=minCut+beta*Math.abs(dx); x+=a(c,dt)*(v-x); return x; }; }
+let mapX = null, mapY = null, fX = oneEuro(), fY = oneEuro();
+
+async function boot(){
+  status("Loading face model…");
+  const { FaceLandmarker, FilesetResolver } = await import(MP + "/vision_bundle.mjs");
+  const files = await FilesetResolver.forVisionTasks(MP + "/wasm");
+  const mk = delegate => FaceLandmarker.createFromOptions(files, { baseOptions:{ modelAssetPath: MODEL, delegate },
+    runningMode:"VIDEO", numFaces:1, outputFacialTransformationMatrixes:true });
+  try { landmarker = await mk("GPU"); } catch(e){ landmarker = await mk("CPU"); }
+  status("Starting front camera…");
+  const stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:"user", width:{ideal:640}, height:{ideal:480} }, audio:false });
+  vid.srcObject = stream; await vid.play();
+}
+let lastVT = -1, feat = null, gaze = null, steady = false;
+// v1.2 eye-lock: the eyes count as "locked" when both irises are found and have held still for ~8 frames
+const HIST = [], STEADY_TOL = 0.02;
+function updSteady(){ if (!feat){ HIST.length = 0; steady = false; return; }
+  HIST.push([(feat[1]+feat[3])/2, (feat[2]+feat[4])/2]); if (HIST.length > 8) HIST.shift();
+  if (HIST.length < 6){ steady = false; return; }
+  const sd = j => { const m = HIST.reduce((a,h)=>a+h[j],0)/HIST.length; return Math.sqrt(HIST.reduce((a,h)=>a+(h[j]-m)**2,0)/HIST.length); };
+  steady = Math.max(sd(0), sd(1)) < STEADY_TOL; }
+function track(now){
+  if (landmarker && vid.readyState >= 2 && vid.currentTime !== lastVT){
+    lastVT = vid.currentTime; feat = features(landmarker.detectForVideo(vid, now)); updSteady();
+    if (feat && mapX) gaze = { x: fX(mapX(feat), now), y: fY(mapY(feat), now), t: now };
+  }
+}
+
+// screen light: a bright frame round the screen lights the face like a selfie flash (v1.1: added after
+// Barry found it would not track in a dark room -- the front camera is a normal camera, it needs light)
+function bg(){ ctx.fillStyle = "#050a08"; ctx.fillRect(0,0,W,H);
+  if (!opt.light) return; const t = Math.max(28, M*0.09);
+  ctx.strokeStyle = "#f4fff8"; ctx.lineWidth = 2*t; ctx.strokeRect(0, 0, W, H); }
+// ---------------------------------------------------------------- calibration (dwell, no taps)
+let mode = "idle", cal = null, accPx = NaN;
+function startCal(){ const P=[]; for (const y of [.12,.47,.82]) for (const x of [.18,.5,.82]) P.push({x:x*W,y:y*H});
+  cal = { pts: P.sort(()=>Math.random()-.5), i:0, t0: performance.now(), X:[], Yx:[], Yy:[], phase:"cal", val:[] };
+  mode = "cal"; mapX = mapY = null; fX = oneEuro(); fY = oneEuro(); }
+const SETTLE = 600, NEED = 20, TIMEOUT = 4500;
+function stepCal(now){
+  const p = cal.pts[cal.i], el = now - cal.t0;
+  if (cal.n === undefined) cal.n = 0;
+  if (el > SETTLE && feat && steady){
+    if (cal.phase === "cal"){ cal.X.push(feat); cal.Yx.push(p.x); cal.Yy.push(p.y); cal.n++; }
+    else if (gaze){ cal.val.push(Math.hypot(gaze.x-p.x, gaze.y-p.y)); cal.n++; }
+  }
+  if (cal.n >= NEED || el > SETTLE + TIMEOUT){
+    if (cal.n < NEED) cal.weak = (cal.weak||0) + 1;
+    cal.i++; cal.t0 = now; cal.n = 0;
+    if (cal.i >= cal.pts.length){
+      if (cal.phase === "cal"){
+        if (cal.X.length < 60){ status("Face not found often enough — check lighting and try again."); mode="idle"; $("pStart").classList.remove("hidden"); $("bStart").disabled=false; return; }
+        mapX = fitRidge(cal.X, cal.Yx); mapY = fitRidge(cal.X, cal.Yy);
+        cal.phase = "val"; cal.i = 0; cal.pts = [{x:.5*W,y:.12*H},{x:.82*W,y:.47*H},{x:.5*W,y:.82*H},{x:.18*W,y:.47*H}];
+      } else {
+        cal.val.sort((a,b)=>a-b); accPx = cal.val.length ? cal.val[Math.floor(cal.val.length/2)] : NaN;
+        $("hAcc").textContent = isFinite(accPx) ? `±${Math.round(accPx)} px` : "";
+        logLine(`calibration,${new Date().toISOString()},median_val_err_px=${Math.round(accPx)},dots_timed_out=${cal.weak||0},screen=${W}x${H}`);
+        if (!maze) newMaze(); mode = "play";
+      }
+    }
+  }
+  bg();
+  const q = cal.pts[cal.i]; if (!q) return;
+  const st = !feat ? 0 : (steady && el > SETTLE ? 2 : 1);            // 0 no eyes, 1 eyes moving, 2 LOCKED
+  const col = ["#ff6b5a", "#ffc861", "#7dffb0"][st], prog = Math.min(1, cal.n / NEED);
+  ctx.save();
+  if (st === 2){ ctx.shadowColor = "#7dffb0"; ctx.shadowBlur = 18 + 18*Math.sin(now/120)**2; }
+  ctx.fillStyle = col; ctx.beginPath(); ctx.arc(q.x, q.y, st === 2 ? 10 : 7, 0, 7); ctx.fill(); ctx.restore();
+  ctx.strokeStyle = "rgba(62,168,116,.45)"; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(q.x, q.y, 22, 0, 7); ctx.stroke();
+  ctx.strokeStyle = col; ctx.lineWidth = 4; ctx.beginPath(); ctx.arc(q.x, q.y, 22, -Math.PI/2, -Math.PI/2 + prog*2*Math.PI); ctx.stroke();
+  ctx.fillStyle = "#a9d9bd"; ctx.font = "15px system-ui"; ctx.textAlign = "center";
+  ctx.fillText(cal.phase === "cal" ? `Look at the dot · ${cal.i+1}/${cal.pts.length}` : `Checking accuracy · ${cal.i+1}/4`, W/2, H*0.86);
+  ctx.fillStyle = col;
+  ctx.fillText(["Eyes not found — more light, face the screen", "Eyes found — hold still on the dot", "Locked ✓"][st], W/2, H*0.89);
+}
+
+// ---------------------------------------------------------------- maze (recursive backtracker) + BFS shortest path
+// walls bitmask per cell: 1=N 2=E 4=S 8=W (bit set = wall present)
+const DIRS = [ {b:1,dx:0,dy:-1,o:4,name:"up"}, {b:2,dx:1,dy:0,o:8,name:"right"}, {b:4,dx:0,dy:1,o:1,name:"down"}, {b:8,dx:-1,dy:0,o:2,name:"left"} ];
+let maze = null, level = 1, runner = null, steps = 0, startT = 0, trail = [];
+function genMaze(n){
+  const cell = Array(n*n).fill(15), seen = Array(n*n).fill(false), st = [0]; seen[0] = true;
+  while (st.length){ const c = st[st.length-1], x = c % n, y = (c/n)|0;
+    const nb = DIRS.map((d,i)=>[d,i]).filter(([d])=>{ const nx=x+d.dx, ny=y+d.dy; return nx>=0&&ny>=0&&nx<n&&ny<n&&!seen[ny*n+nx]; });
+    if (!nb.length){ st.pop(); continue; }
+    const [d] = nb[Math.floor(Math.random()*nb.length)], nc = (y+d.dy)*n + (x+d.dx);
+    cell[c] &= ~d.b; cell[nc] &= ~d.o; seen[nc] = true; st.push(nc); }
+  return cell; }
+function bfs(cell, n, from, to){ const dist = Array(n*n).fill(-1), q=[from]; dist[from]=0;
+  while (q.length){ const c=q.shift(); if (c===to) return dist[c]; const x=c%n, y=(c/n)|0;
+    for (const d of DIRS){ if (cell[c] & d.b) continue; const nc=(y+d.dy)*n+(x+d.dx); if (dist[nc]<0){ dist[nc]=dist[c]+1; q.push(nc); } } }
+  return -1; }
+function newMaze(){ const n = Math.min(4 + level, 12); const cell = genMaze(n);
+  maze = { n, cell, exit: n*n-1, best: bfs(cell, n, 0, n*n-1) };
+  runner = { c:0, px:0, py:0 }; steps = 0; trail = [0]; startT = performance.now();
+  $("hLevel").textContent = level; $("hSteps").textContent = 0; $("hBest").textContent = maze.best; }
+
+// ---------------------------------------------------------------- gaze -> direction (4 sectors outside a dead zone)
+let dirIdx = -1, dirSince = 0, bump = 0, bumpDir = -1, winT = 0, bumped = false;
+const deadR = () => M*0.16;
+function stepPlay(now){
+  if (winT){ if (now - winT > 1400){ winT = 0; level++; newMaze(); } return; }
+  $("hTime").textContent = ((now - startT)/1000).toFixed(1);
+  let d = -1;
+  if (gaze && now - gaze.t < 250){ const dx = gaze.x - CX, dy = gaze.y - CY;
+    if (Math.hypot(dx, dy) > deadR()) d = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 1 : 3) : (dy > 0 ? 2 : 0); }
+  if (d !== dirIdx){ dirIdx = d; dirSince = now; bumped = false; }
+  if (dirIdx >= 0 && now - dirSince >= opt.speed){
+    dirSince = now; const n = maze.n, c = runner.c, D = DIRS[dirIdx];
+    if (maze.cell[c] & D.b){ if (!bumped){ bump = now; bumpDir = dirIdx; buzz("bump"); bumped = true; } }  // buzz once per wall, not on repeat
+    else { runner.c = (((c/n)|0)+D.dy)*n + (c%n + D.dx); steps++; trail.push(runner.c); $("hSteps").textContent = steps; tick();
+      if (runner.c === maze.exit){ winT = now; buzz("win");
+        logLine(`maze,${new Date().toISOString()},level=${level},size=${n}x${n},steps=${steps},shortest=${maze.best},efficiency=${(maze.best/steps).toFixed(2)},seconds=${((now-startT)/1000).toFixed(1)}`); } }
+  }
+}
+
+// ---------------------------------------------------------------- feedback
+function tone(f, dur, vol){ try { if (!audio) return; const o = audio.createOscillator(), g = audio.createGain();
+  o.frequency.value = f; g.gain.setValueAtTime(0.0001, audio.currentTime); g.gain.exponentialRampToValueAtTime(vol, audio.currentTime+0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, audio.currentTime+dur); o.connect(g).connect(audio.destination); o.start(); o.stop(audio.currentTime+dur+0.05); } catch(e){} }
+function tick(){ tone(520, 0.08, 0.06); try { navigator.vibrate && navigator.vibrate(8); } catch(e){} }
+function buzz(k){ try { navigator.vibrate && navigator.vibrate(k === "win" ? [40,40,40,40,120] : 25); } catch(e){}
+  if (k === "win"){ tone(660,0.4,0.2); setTimeout(()=>tone(880,0.5,0.2),160); } else tone(150,0.12,0.12); }
+
+// ---------------------------------------------------------------- drawing
+function drawPlay(now){
+  bg();
+  const fr = opt.light ? Math.max(28, M*0.09) : 0;
+  const n = maze.n, S = Math.min(W*0.78, W - 2*(fr + 46), H*0.56), cs = S/n, ox = CX - S/2, oy = CY - S/2;
+  // trail
+  ctx.fillStyle = "rgba(62,168,116,.16)";
+  for (const c of trail) ctx.fillRect(ox + (c%n)*cs + cs*0.2, oy + ((c/n)|0)*cs + cs*0.2, cs*0.6, cs*0.6);
+  // exit
+  const ex = maze.exit, pulse = 0.5 + 0.5*Math.sin(now/300);
+  ctx.save(); ctx.shadowColor = "#7dffb0"; ctx.shadowBlur = 10 + 20*pulse; ctx.strokeStyle = "#d8ffe8"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(ox + (ex%n+.5)*cs, oy + (((ex/n)|0)+.5)*cs, cs*0.28, 0, 7); ctx.stroke(); ctx.restore();
+  // walls
+  ctx.strokeStyle = "#3ea874"; ctx.lineWidth = Math.max(2, cs*0.08); ctx.lineCap = "round"; ctx.beginPath();
+  for (let c=0;c<n*n;c++){ const x = ox + (c%n)*cs, y = oy + ((c/n)|0)*cs, w = maze.cell[c];
+    if (w&1){ ctx.moveTo(x,y); ctx.lineTo(x+cs,y); } if (w&2){ ctx.moveTo(x+cs,y); ctx.lineTo(x+cs,y+cs); }
+    if (w&4){ ctx.moveTo(x,y+cs); ctx.lineTo(x+cs,y+cs); } if (w&8){ ctx.moveTo(x,y); ctx.lineTo(x,y+cs); } }
+  ctx.stroke();
+  // runner (eased toward its cell)
+  const tx = (runner.c%n+.5)*cs, ty = (((runner.c/n)|0)+.5)*cs;
+  runner.px += (tx - runner.px)*0.35; runner.py += (ty - runner.py)*0.35;
+  const won = winT ? Math.min(1,(now-winT)/600) : 0;
+  ctx.save(); ctx.shadowColor = "#7dffb0"; ctx.shadowBlur = 18 + 40*won; ctx.fillStyle = "#7dffb0";
+  ctx.beginPath(); ctx.arc(ox + runner.px, oy + runner.py, cs*0.3*(1+won), 0, 7); ctx.fill(); ctx.restore();
+  // direction pads at the four edges, filling as dwell builds
+  const pads = [ {x:CX, y:Math.max(fr+30, oy-48)}, {x:W-fr-26, y:CY}, {x:CX, y:Math.min(H-fr-70, oy+S+48)}, {x:fr+26, y:CY} ];
+  pads.forEach((p,i)=>{ const active = i === dirIdx, fill = active ? Math.min(1,(now-dirSince)/opt.speed) : 0;
+    const hit = i === bumpDir && now - bump < 300;
+    ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(i*Math.PI/2);
+    ctx.fillStyle = hit ? "rgba(255,107,90,.9)" : `rgba(125,255,176,${0.18 + 0.72*fill})`;
+    if (active && !hit){ ctx.shadowColor = "#7dffb0"; ctx.shadowBlur = 20*fill; }
+    ctx.beginPath(); ctx.moveTo(0,-16); ctx.lineTo(16,10); ctx.lineTo(-16,10); ctx.closePath(); ctx.fill(); ctx.restore(); });
+  // dead-zone hint
+  ctx.strokeStyle = dirIdx < 0 ? "rgba(125,255,176,.35)" : "rgba(29,90,62,.35)"; ctx.lineWidth = 1; ctx.setLineDash([3,6]);
+  ctx.beginPath(); ctx.arc(CX, CY, deadR(), 0, 7); ctx.stroke(); ctx.setLineDash([]);
+  if (winT){ ctx.fillStyle = "#d8ffe8"; ctx.font = "600 24px system-ui"; ctx.textAlign = "center";
+    ctx.fillText(`Out in ${steps} steps (shortest ${maze.best})`, CX, Math.min(H-90, oy+S+90)); }
+  if (opt.dot && gaze){ ctx.fillStyle = "rgba(216,255,232,.5)"; ctx.beginPath(); ctx.arc(gaze.x, gaze.y, 7, 0, 7); ctx.fill(); }
+  if (!feat){ ctx.fillStyle = "#ff6b5a"; ctx.font = "15px system-ui"; ctx.textAlign = "center"; ctx.fillText("Eyes not detected", W/2, 24); }
+}
+
+let lastT = performance.now();
+function loop(now){ lastT = now; track(now);
+  if (mode === "cal") stepCal(now); else if (mode === "play"){ stepPlay(now); drawPlay(now); }
+  requestAnimationFrame(loop); }
+requestAnimationFrame(loop);
+
+// ---------------------------------------------------------------- log + UI
+const LOG = ["kind,time,detail..."];
+function logLine(s){ LOG.push(s); $("log").textContent = LOG.join("\n"); }
+$("bStart").onclick = async () => {
+  opt.speed = +$("optSpeed").value; opt.light = $("optLight").checked; opt.dot = $("optDot").checked; opt.cam = $("optCam").checked; $("bStart").disabled = true;
+  try { audio = audio || new (window.AudioContext || window.webkitAudioContext)(); } catch(e){}
+  try { if (!landmarker) await boot(); }
+  catch(e){ status("Could not start camera/model: " + (e && e.message || e) + ". Open from an https address in Chrome and allow the camera."); $("bStart").disabled = false; return; }
+  vid.style.display = opt.cam ? "block" : "none"; $("menuBtn").style.display = "block"; $("pStart").classList.add("hidden"); startCal();
+};
+$("menuBtn").onclick = () => { if (mode === "play") mode = "paused"; $("pMenu").classList.remove("hidden"); $("log").textContent = LOG.join("\n"); };
+$("bResume").onclick = () => { $("pMenu").classList.add("hidden"); if (mapX){ mode = "play"; startT = performance.now() - 1000*parseFloat($("hTime").textContent); } else startCal(); };
+$("bRecal").onclick = () => { $("pMenu").classList.add("hidden"); startCal(); };
+$("bSkip").onclick = () => { $("pMenu").classList.add("hidden"); if (mapX){ newMaze(); mode = "play"; } else startCal(); };
+$("bCopy").onclick = async () => { try { await navigator.clipboard.writeText(LOG.join("\n")); $("copyMsg").textContent = "Copied."; }
+  catch(e){ $("copyMsg").textContent = "Copy blocked — long-press the log above to select it."; } };
+}
+</script>
+</body>
+</html>
