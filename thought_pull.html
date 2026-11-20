@@ -14,7 +14,7 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);
   font:16px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;overflow:hidden;touch-action:none}
 canvas#stage{position:fixed;inset:0;width:100vw;height:100vh;display:block}
 #hud{position:fixed;left:0;right:0;bottom:0;padding:10px 14px calc(10px + env(safe-area-inset-bottom));
-  display:flex;gap:14px;justify-content:space-between;align-items:center;font-size:14px;color:var(--g2);pointer-events:none}
+  display:flex;gap:14px;justify-content:space-between;align-items:center;font-size:14px;color:var(--g2);pointer-events:none;background:rgba(5,10,8,.92)}
 #hud b{color:var(--g1);font-weight:600}
 #cam{position:fixed;top:10px;right:10px;width:84px;height:112px;object-fit:cover;border-radius:10px;
   border:1px solid var(--g3);transform:scaleX(-1);opacity:.55;display:none}
@@ -48,6 +48,7 @@ pre#log{max-height:30vh;overflow:auto;text-align:left;font-size:12px;background:
   <div class="row">
     <label><input type="checkbox" id="optTarget" checked> Marked target (scores hit-rate vs chance)</label>
     <label><input type="checkbox" id="optSqueeze"> Squeeze to collapse (motion sensor)</label>
+    <label><input type="checkbox" id="optLight" checked> Screen light (for dim rooms)</label>
     <label><input type="checkbox" id="optDot"> Show gaze dot</label>
     <label><input type="checkbox" id="optCam"> Show camera</label>
   </div>
@@ -79,7 +80,7 @@ addEventListener("resize", resize); resize();
 
 const status = msg => { $("status").textContent = msg; };
 let landmarker = null, audio = null;
-const opt = { target:true, squeeze:false, dot:false, cam:false };
+const opt = { target:true, squeeze:false, dot:false, cam:false, light:true };
 
 // ---------------------------------------------------------------- features from face landmarks
 // MediaPipe face mesh indices. Right eye (image left): corners 33/133, lids 159/145, iris centre 468.
@@ -142,31 +143,48 @@ async function boot(){
   vid.srcObject = stream; await vid.play();
 }
 
-let lastVT = -1, feat = null, gaze = null;
+let lastVT = -1, feat = null, gaze = null, steady = false;
+// v1.2 eye-lock: the eyes count as "locked" when both irises are found and have held still for ~8 frames
+// v1.3: 0.02 was far too strict on Barry's phone (stuck on amber). Start at 0.05 and relax automatically
+// by x1.4 for every 1.5 s spent on a dot without a lock (cap 0.15); the value used is logged for tuning.
+const HIST = []; let STEADY_TOL = 0.05;
+function updSteady(){ if (!feat){ HIST.length = 0; steady = false; return; }
+  HIST.push([(feat[1]+feat[3])/2, (feat[2]+feat[4])/2]); if (HIST.length > 8) HIST.shift();
+  if (HIST.length < 6){ steady = false; return; }
+  const sd = j => { const m = HIST.reduce((a,h)=>a+h[j],0)/HIST.length; return Math.sqrt(HIST.reduce((a,h)=>a+(h[j]-m)**2,0)/HIST.length); };
+  steady = Math.max(sd(0), sd(1)) < STEADY_TOL; }
 function track(now){
   if (landmarker && vid.readyState >= 2 && vid.currentTime !== lastVT){
     lastVT = vid.currentTime;
     const res = landmarker.detectForVideo(vid, now);
-    feat = features(res);
+    feat = features(res); updSteady();
     if (feat && mapX){ gaze = { x: fX(mapX(feat), now), y: fY(mapY(feat), now), t: now }; }
   }
 }
 
+// screen light: a bright frame round the screen lights the face like a selfie flash (v1.1: added after
+// Barry found it would not track in a dark room -- the front camera is a normal camera, it needs light)
+function bg(){ ctx.fillStyle = "#050a08"; ctx.fillRect(0,0,W,H);
+  if (!opt.light) return; const t = Math.max(28, M*0.09);
+  ctx.strokeStyle = "#f4fff8"; ctx.lineWidth = 2*t; ctx.strokeRect(0, 0, W, H); }
 // ---------------------------------------------------------------- calibration (no taps: dwell on each dot)
 let mode = "idle", cal = null;
-function calPoints(){ const xs=[.12,.5,.88], ys=[.12,.46,.80]; const P=[];
+function calPoints(){ const xs=[.18,.5,.82], ys=[.12,.46,.80]; const P=[];
   for (const y of ys) for (const x of xs) P.push({x:x*W, y:y*H}); return P.sort(()=>Math.random()-.5); }
 function startCal(){ cal = { pts: calPoints(), i:0, t0: performance.now(), X:[], Yx:[], Yy:[], phase:"cal", val:[] };
   mode = "cal"; mapX = mapY = null; fX = oneEuro(); fY = oneEuro(); }
-const SETTLE = 700, COLLECT = 1100;
+const SETTLE = 600, NEED = 20, TIMEOUT = 3500;
 function stepCal(now){
   const p = cal.pts[cal.i], el = now - cal.t0;
-  if (el > SETTLE && feat){
-    if (cal.phase === "cal"){ cal.X.push(feat); cal.Yx.push(p.x); cal.Yy.push(p.y); }
-    else if (gaze) cal.val.push(Math.hypot(gaze.x-p.x, gaze.y-p.y));
+  if (cal.n === undefined) cal.n = 0;
+  if (cal.n === 0 && el > SETTLE + 1500*(cal.relax||1) && STEADY_TOL < 0.15){ STEADY_TOL = Math.min(0.15, STEADY_TOL*1.4); cal.relax = (cal.relax||1) + 1; }
+  if (el > SETTLE && feat && steady){
+    if (cal.phase === "cal"){ cal.X.push(feat); cal.Yx.push(p.x); cal.Yy.push(p.y); cal.n++; }
+    else if (gaze){ cal.val.push(Math.hypot(gaze.x-p.x, gaze.y-p.y)); cal.n++; }
   }
-  if (el > SETTLE + COLLECT){
-    cal.i++; cal.t0 = now;
+  if (cal.n >= NEED || el > SETTLE + TIMEOUT){
+    if (cal.n < NEED) cal.weak = (cal.weak||0) + 1;
+    cal.i++; cal.t0 = now; cal.n = 0; cal.relax = 1;
     if (cal.i >= cal.pts.length){
       if (cal.phase === "cal"){
         if (cal.X.length < 60){ status("Face not found often enough — check lighting and try again."); return showStart(); }
@@ -176,28 +194,32 @@ function stepCal(now){
         cal.val.sort((a,b)=>a-b);
         accPx = cal.val.length ? cal.val[Math.floor(cal.val.length/2)] : NaN;
         $("hAcc").textContent = isFinite(accPx) ? `±${Math.round(accPx)} px` : "";
-        logLine(`calibration,${new Date().toISOString()},median_val_err_px=${Math.round(accPx)},screen=${W}x${H}`);
+        logLine(`calibration,${new Date().toISOString()},median_val_err_px=${Math.round(accPx)},dots_timed_out=${cal.weak||0},steady_tol=${STEADY_TOL.toFixed(3)},screen=${W}x${H}`);
         newRing(); mode = "play";
       }
     }
   }
   // draw
-  ctx.fillStyle = "#050a08"; ctx.fillRect(0,0,W,H);
+  bg();
   const q = cal.pts[cal.i]; if (!q) return;
-  const k = Math.min(1, el/SETTLE);
-  ctx.strokeStyle = "#3ea874"; ctx.lineWidth = 2;
-  ctx.beginPath(); ctx.arc(q.x, q.y, 26 - 14*k, 0, 7); ctx.stroke();
-  ctx.fillStyle = el > SETTLE ? "#7dffb0" : "#3ea874"; ctx.beginPath(); ctx.arc(q.x, q.y, 6, 0, 7); ctx.fill();
+  const st = !feat ? 0 : (steady && el > SETTLE ? 2 : 1);            // 0 no eyes, 1 eyes moving, 2 LOCKED
+  const col = ["#ff6b5a", "#ffc861", "#7dffb0"][st], prog = Math.min(1, cal.n / NEED);
+  ctx.save();
+  if (st === 2){ ctx.shadowColor = "#7dffb0"; ctx.shadowBlur = 18 + 18*Math.sin(now/120)**2; }
+  ctx.fillStyle = col; ctx.beginPath(); ctx.arc(q.x, q.y, st === 2 ? 10 : 7, 0, 7); ctx.fill(); ctx.restore();
+  ctx.strokeStyle = "rgba(62,168,116,.45)"; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(q.x, q.y, 22, 0, 7); ctx.stroke();
+  ctx.strokeStyle = col; ctx.lineWidth = 4; ctx.beginPath(); ctx.arc(q.x, q.y, 22, -Math.PI/2, -Math.PI/2 + prog*2*Math.PI); ctx.stroke();
   ctx.fillStyle = "#a9d9bd"; ctx.font = "15px system-ui"; ctx.textAlign = "center";
-  ctx.fillText(cal.phase === "cal" ? `Look at the dot · ${cal.i+1}/${cal.pts.length}` : `Checking accuracy · ${cal.i+1}/4`, W/2, H*0.94);
-  if (!feat) { ctx.fillStyle = "#ff6b5a"; ctx.fillText("Face / eyes not detected", W/2, H*0.97); }
+  ctx.fillText(cal.phase === "cal" ? `Look at the dot · ${cal.i+1}/${cal.pts.length}` : `Checking accuracy · ${cal.i+1}/4`, W/2, H*0.27);
+  ctx.fillStyle = col;
+  ctx.fillText(["Eyes not found — more light, face the screen", "Eyes found — hold still on the dot", "Locked ✓"][st], W/2, H*0.31);
 }
 let accPx = NaN;
 
 // ---------------------------------------------------------------- the game
 const N = 6; let nodes = [], level = 1, hits = 0, tries = 0, spawnT = 0, lockIdx = -1, lockSince = 0, otherSince = 0, otherIdx = -1;
 let flash = 0, flashGood = true, phase0 = 0;
-const ringR = () => M*0.36, coreR = () => M*0.11;
+const ringR = () => M*(opt.light ? 0.31 : 0.36), coreR = () => M*0.11;
 function newRing(){ phase0 = Math.random()*Math.PI*2; const tgt = Math.floor(Math.random()*N);
   nodes = Array.from({length:N}, (_,i)=>({ i, a: phase0 + i*2*Math.PI/N, r: ringR(), glow: 0, target: i===tgt, dead:false }));
   spawnT = performance.now(); lockIdx = -1; }
@@ -258,7 +280,7 @@ function buzz(good){ try { navigator.vibrate && navigator.vibrate(good ? [40,40,
 
 // ---------------------------------------------------------------- drawing
 function drawPlay(now){
-  ctx.fillStyle = "#050a08"; ctx.fillRect(0,0,W,H);
+  bg();
   const R = ringR(), C = coreR();
   ctx.strokeStyle = "rgba(29,90,62,.6)"; ctx.lineWidth = 1;
   ctx.beginPath(); ctx.arc(CX, CY, R, 0, 7); ctx.stroke();
@@ -299,7 +321,7 @@ const LOG = ["kind,time,detail..."];
 function logLine(s){ LOG.push(s); $("log").textContent = LOG.join("\n"); }
 function showStart(){ mode = "idle"; $("pStart").classList.remove("hidden"); $("bStart").disabled = false; }
 $("bStart").onclick = async () => {
-  for (const k of ["target","squeeze","dot","cam"]) opt[k] = $("opt"+k[0].toUpperCase()+k.slice(1)).checked;
+  for (const k of ["target","squeeze","dot","cam","light"]) opt[k] = $("opt"+k[0].toUpperCase()+k.slice(1)).checked;
   $("bStart").disabled = true;
   try { audio = audio || new (window.AudioContext || window.webkitAudioContext)(); } catch(e){}
   try { if (opt.squeeze && window.DeviceMotionEvent && DeviceMotionEvent.requestPermission) await DeviceMotionEvent.requestPermission(); } catch(e){}

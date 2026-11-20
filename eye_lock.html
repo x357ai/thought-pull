@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Eye Lock</title>
+<style>
+/* Eye Lock v1 — X357-AI · Barry Lee Guevremont (design: Barry's red-dot / green-circle idea)
+   RED dot = where the phone sees your eyes looking. Put the red dot inside the GREEN circle and hold: LOCK.
+   Once locked, the green circle follows your eyes: carry it into the target ring.
+   Blink = the dot flashes white. Long blink (about 0.6 s) = drop the circle / skip. */
+:root{--bg:#050a08;--ink:#d8ffe8;--g1:#7dffb0;--g2:#3ea874;--g3:#1d5a3e;--red:#ff4d4d}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);
+  font:16px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;overflow:hidden;touch-action:none}
+canvas#stage{position:fixed;inset:0;width:100vw;height:100vh;display:block}
+#hud{position:fixed;left:0;right:0;bottom:0;padding:10px 14px calc(10px + env(safe-area-inset-bottom));
+  display:flex;gap:12px;justify-content:space-between;font-size:14px;color:var(--g2);pointer-events:none;background:rgba(5,10,8,.92)}
+#hud b{color:var(--g1);font-weight:600}
+.panel{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:14px;padding:28px;text-align:center;background:rgba(5,10,8,.95)}
+.panel h1{margin:0;font-size:34px;line-height:1.05;color:var(--g1)}
+.panel p{margin:0;max-width:34em;color:#a9d9bd}
+.panel small{color:var(--g2);max-width:34em}
+.key{display:grid;grid-template-columns:auto 1fr;gap:6px 12px;text-align:left;color:#a9d9bd;font-size:15px;max-width:30em}
+.dot{width:16px;height:16px;border-radius:50%;margin-top:3px}
+button{font:inherit;font-size:17px;min-height:48px;padding:10px 22px;border-radius:24px;border:1px solid var(--g2);
+  background:#0c1f16;color:var(--g1);cursor:pointer}
+button:focus-visible{outline:2px solid var(--g1);outline-offset:3px}
+.row{display:flex;gap:12px;flex-wrap:wrap;justify-content:center}
+label{display:flex;gap:8px;align-items:center;color:#a9d9bd;font-size:15px}
+input[type=checkbox]{width:22px;height:22px;accent-color:var(--g1)}
+#menuBtn{position:fixed;top:10px;left:10px;min-height:40px;padding:6px 14px;font-size:14px;opacity:.8;display:none;z-index:2}
+pre#log{max-height:30vh;overflow:auto;text-align:left;font-size:12px;background:#08140e;padding:10px;border-radius:8px;
+  width:min(92vw,520px);color:#a9d9bd;white-space:pre-wrap}
+.hidden{display:none!important}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<video id="cam" playsinline muted style="display:none"></video>
+<div id="hud"><span>Locks <b id="hLocks">0</b></span><span>Moves <b id="hMoves">0</b></span><span>Blinks <b id="hBlinks">0</b></span><span>Learned <b id="hLearn">0</b></span></div>
+<button id="menuBtn">Menu</button>
+
+<div class="panel" id="pStart">
+  <h1>Eye Lock</h1>
+  <div class="key">
+    <span class="dot" style="background:#ff4d4d"></span><span><b>Red dot</b> — where the phone sees your eyes looking</span>
+    <span class="dot" style="background:#7dffb0"></span><span><b>Green circle</b> — get the red dot inside it and hold to <b>lock</b></span>
+    <span class="dot" style="border:2px dashed #d8ffe8"></span><span><b>Target ring</b> — once locked, the circle follows your eyes: carry it here</span>
+    <span class="dot" style="background:#fff"></span><span><b>Blink</b> — dot flashes white. Long blink (~0.6 s) drops the circle or skips</span>
+  </div>
+  <p>First, 5 quick dots teach the phone your eyes. The red dot keeps getting more accurate the more you play: every time you look at a green circle, it learns.</p>
+  <div class="row">
+    <label><input type="checkbox" id="optLight" checked> Screen light (for dim rooms)</label>
+  </div>
+  <button id="bStart">Start</button>
+  <small id="status">Camera-based eye tracking (MediaPipe iris landmarks). Nothing leaves the phone.</small>
+</div>
+
+<div class="panel hidden" id="pMenu">
+  <h1>Session</h1>
+  <pre id="log"></pre>
+  <div class="row">
+    <button id="bResume">Resume</button>
+    <button id="bRecal">Redo 5 dots</button>
+    <button id="bCopy">Copy log (CSV)</button>
+  </div>
+  <small id="copyMsg"></small>
+</div>
+
+<script type="module">
+{
+const MP = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+const MODEL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+const $ = id => document.getElementById(id);
+const cv = $("stage"), ctx = cv.getContext("2d"), vid = $("cam");
+let W = 0, H = 0, DPR = 1, M = 0;
+function resize(){ DPR = Math.min(devicePixelRatio || 1, 2); W = innerWidth; H = innerHeight;
+  cv.width = W*DPR; cv.height = H*DPR; ctx.setTransform(DPR,0,0,DPR,0,0); M = Math.min(W,H); }
+addEventListener("resize", resize); resize();
+const status = msg => { $("status").textContent = msg; };
+const opt = { light:true };
+let landmarker = null, audio = null;
+
+// ---------------------------------------------------------------- eye features
+// face = face found; open = both eyes open; feat = [1, iris-u (avg), iris-v (avg), head yaw, head pitch]
+function eyeFeat(L, outer, inner, up, lo, iris){
+  const a = L[inner], b = L[outer], c = L[iris];
+  const ex = b.x - a.x, ey = b.y - a.y, w2 = ex*ex + ey*ey, w = Math.sqrt(w2);
+  return { u: ((c.x-a.x)*ex + (c.y-a.y)*ey) / w2, v: ((c.x-a.x)*(-ey) + (c.y-a.y)*ex) / w2,
+           open: Math.hypot(L[up].x-L[lo].x, L[up].y-L[lo].y) / w };
+}
+let face = false, eyesOpen = false, feat = null;
+function readFace(res){
+  face = !!(res.faceLandmarks && res.faceLandmarks.length && res.faceLandmarks[0].length >= 478);
+  if (!face){ eyesOpen = false; feat = null; return; }
+  const L = res.faceLandmarks[0];
+  const r = eyeFeat(L, 33, 133, 159, 145, 468), l = eyeFeat(L, 263, 362, 386, 374, 473);
+  eyesOpen = Math.min(r.open, l.open) >= 0.12;
+  if (!eyesOpen){ feat = null; return; }
+  let yaw = 0, pitch = 0; const T = res.facialTransformationMatrixes && res.facialTransformationMatrixes[0];
+  if (T && T.data){ yaw = T.data[8]; pitch = T.data[9]; }
+  feat = [1, (r.u + l.u)/2, (r.v + l.v)/2, yaw, pitch];
+}
+
+// steadiness (adaptive, as in Gaze Maze v1.3)
+const HIST = []; let STEADY_TOL = 0.05, steady = false;
+function updSteady(){ if (!feat){ HIST.length = 0; steady = false; return; }
+  HIST.push([feat[1], feat[2]]); if (HIST.length > 8) HIST.shift();
+  if (HIST.length < 6){ steady = false; return; }
+  const sd = j => { const m = HIST.reduce((a,h)=>a+h[j],0)/HIST.length; return Math.sqrt(HIST.reduce((a,h)=>a+(h[j]-m)**2,0)/HIST.length); };
+  steady = Math.max(sd(0), sd(1)) < STEADY_TOL; }
+
+// ---------------------------------------------------------------- ridge regression + smoothing
+function solve(A, b){ const n = b.length; A = A.map((r,i)=>[...r, b[i]]);
+  for (let i=0;i<n;i++){ let p=i; for (let k=i+1;k<n;k++) if (Math.abs(A[k][i])>Math.abs(A[p][i])) p=k;
+    [A[i],A[p]]=[A[p],A[i]]; const d=A[i][i]||1e-12;
+    for (let k=0;k<n;k++){ if(k===i) continue; const f=A[k][i]/d; for(let j=i;j<=n;j++) A[k][j]-=f*A[i][j]; } }
+  return A.map((r,i)=>r[n]/(r[i]||1e-12)); }
+function fitRidge(X, Y, lam){ const d = X[0].length; const mu = Array(d).fill(0), sd = Array(d).fill(1);
+  for (let j=1;j<d;j++){ mu[j] = X.reduce((s,x)=>s+x[j],0)/X.length;
+    sd[j] = Math.sqrt(X.reduce((s,x)=>s+(x[j]-mu[j])**2,0)/X.length) || 1; }
+  const Z = X.map(x=>x.map((v,j)=> j? (v-mu[j])/sd[j] : 1));
+  const XtX = Array.from({length:d},(_,i)=>Array.from({length:d},(_,j)=>Z.reduce((s,z)=>s+z[i]*z[j],0)+(i===j&&i?lam*Z.length:0)));
+  const Xty = Array.from({length:d},(_,i)=>Z.reduce((s,z,k)=>s+z[i]*Y[k],0));
+  const w = solve(XtX, Xty);
+  return x => x.reduce((s,v,j)=> s + w[j]*(j? (v-mu[j])/sd[j] : 1), 0); }
+function oneEuro(minCut=0.8, beta=0.015, dCut=1.0){ let x=null, dx=0, t=null; const a=(c,dt)=>1/(1+1/(2*Math.PI*c*dt));
+  return (v, now)=>{ if (x===null){ x=v; t=now; return v; } const dt=Math.max((now-t)/1000,1e-3); t=now;
+    const d=(v-x)/dt; dx+=a(dCut,dt)*(d-dx); const c=minCut+beta*Math.abs(dx); x+=a(c,dt)*(v-x); return x; }; }
+let mapX = null, mapY = null, fX = oneEuro(), fY = oneEuro();
+// training pairs: the 5 start dots are kept forever; game samples form a rolling window (implicit calibration)
+let CAL = [], LIVE = [], sinceFit = 0;
+function refit(){ const S = CAL.concat(LIVE); if (S.length < 20) return;
+  mapX = fitRidge(S.map(s=>s.f), S.map(s=>s.x), 0.02); mapY = fitRidge(S.map(s=>s.f), S.map(s=>s.y), 0.02);
+  sinceFit = 0; $("hLearn").textContent = LIVE.length; }
+
+// ---------------------------------------------------------------- camera
+async function boot(){
+  status("Loading face model…");
+  const { FaceLandmarker, FilesetResolver } = await import(MP + "/vision_bundle.mjs");
+  const files = await FilesetResolver.forVisionTasks(MP + "/wasm");
+  const mk = delegate => FaceLandmarker.createFromOptions(files, { baseOptions:{ modelAssetPath: MODEL, delegate },
+    runningMode:"VIDEO", numFaces:1, outputFacialTransformationMatrixes:true });
+  try { landmarker = await mk("GPU"); } catch(e){ landmarker = await mk("CPU"); }
+  status("Starting front camera…");
+  const stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:"user", width:{ideal:640}, height:{ideal:480} }, audio:false });
+  vid.srcObject = stream; await vid.play();
+}
+let lastVT = -1, gaze = null, blinkStart = 0, blinkFlash = 0, blinks = 0, longBlinkFired = false;
+function track(now){
+  if (!landmarker || vid.readyState < 2 || vid.currentTime === lastVT) return;
+  lastVT = vid.currentTime; readFace(landmarker.detectForVideo(vid, now)); updSteady();
+  // blink: face visible but eyes closed
+  if (face && !eyesOpen){ if (!blinkStart){ blinkStart = now; longBlinkFired = false; }
+    if (!longBlinkFired && now - blinkStart > 600){ longBlinkFired = true; onLongBlink(now); } }
+  else if (blinkStart){ if (now - blinkStart > 60){ blinks++; blinkFlash = now; $("hBlinks").textContent = blinks; } blinkStart = 0; }
+  if (feat && mapX) gaze = { x: fX(mapX(feat), now), y: fY(mapY(feat), now), t: now };
+}
+
+// ---------------------------------------------------------------- the 5 start dots (colour lock as in Gaze Maze)
+let mode = "idle", cal = null;
+const SETTLE = 500, NEED = 15, TIMEOUT = 3500;
+function bg(){ ctx.fillStyle = "#050a08"; ctx.fillRect(0,0,W,H);
+  if (!opt.light) return; const t = Math.max(28, M*0.09); ctx.strokeStyle = "#f4fff8"; ctx.lineWidth = 2*t; ctx.strokeRect(0,0,W,H); }
+function startCal(){ cal = { pts:[{x:.5,y:.45},{x:.5,y:.16},{x:.82,y:.45},{x:.5,y:.76},{x:.18,y:.45}].map(p=>({x:p.x*W,y:p.y*H})),
+  i:0, t0: performance.now(), n:0, relax:1, weak:0 }; CAL = []; LIVE = []; mapX = mapY = null; gaze = null; mode = "cal"; }
+function stepCal(now){
+  const p = cal.pts[cal.i], el = now - cal.t0;
+  if (cal.n === 0 && el > SETTLE + 1500*cal.relax && STEADY_TOL < 0.15){ STEADY_TOL = Math.min(0.15, STEADY_TOL*1.4); cal.relax++; }
+  if (el > SETTLE && feat && steady){ CAL.push({ f: feat, x: p.x, y: p.y }); cal.n++; }
+  if (cal.n >= NEED || el > SETTLE + TIMEOUT){
+    if (cal.n < NEED) cal.weak++;
+    cal.i++; cal.t0 = now; cal.n = 0; cal.relax = 1;
+    if (cal.i >= cal.pts.length){
+      if (CAL.length < 25){ status("Eyes not seen steadily enough — add light, hold the phone still, try again."); return showStart(); }
+      refit(); fX = oneEuro(); fY = oneEuro();
+      logLine(`start_dots,${new Date().toISOString()},samples=${CAL.length},dots_timed_out=${cal.weak},steady_tol=${STEADY_TOL.toFixed(3)},screen=${W}x${H}`);
+      newRound(now); mode = "play"; return;
+    }
+  }
+  bg(); const q = cal.pts[cal.i]; if (!q) return;
+  const st = !face ? 0 : !eyesOpen ? 3 : (steady && el > SETTLE ? 2 : 1);
+  const col = ["#ff4d4d", "#ffc861", "#7dffb0", "#ffffff"][st], prog = Math.min(1, cal.n / NEED);
+  ctx.save(); if (st === 2){ ctx.shadowColor = "#7dffb0"; ctx.shadowBlur = 18 + 18*Math.sin(now/120)**2; }
+  ctx.fillStyle = col; ctx.beginPath(); ctx.arc(q.x, q.y, st === 2 ? 11 : 8, 0, 7); ctx.fill(); ctx.restore();
+  ctx.strokeStyle = "rgba(62,168,116,.45)"; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(q.x, q.y, 24, 0, 7); ctx.stroke();
+  ctx.strokeStyle = col; ctx.lineWidth = 4; ctx.beginPath(); ctx.arc(q.x, q.y, 24, -Math.PI/2, -Math.PI/2 + prog*2*Math.PI); ctx.stroke();
+  ctx.font = "15px system-ui"; ctx.textAlign = "center"; ctx.fillStyle = "#a9d9bd";
+  ctx.fillText(`Teach the phone your eyes · look at the dot ${cal.i+1}/5`, W/2, H*0.29);
+  ctx.fillStyle = col; ctx.fillText(["Eyes not found — more light, face the screen", "Eyes found — hold still on the dot", "Locked ✓ keep looking", "Blink seen"][st], W/2, H*0.32);
+}
+
+// ---------------------------------------------------------------- the game: seek -> lock -> carry -> drop
+const HOLD = 700;                                         // ms the red dot must stay inside to lock / to score
+let phase = "seek", circ = null, tgt = null, roundT = 0, inSince = 0, locks = 0, moves = 0, okFlash = 0;
+const R = () => Math.max(56, M*0.15);
+function randPos(avoid){ const m = (opt.light ? Math.max(28, M*0.09) : 0) + R() + 10;
+  for (let k=0;k<40;k++){ const p = { x: m + Math.random()*(W-2*m), y: m + 30 + Math.random()*(H-2*m-90) };
+    if (!avoid || Math.hypot(p.x-avoid.x, p.y-avoid.y) > M*0.45) return p; }
+  return { x: W/2, y: H/2 }; }
+function newRound(now){ phase = "seek"; circ = randPos(gaze); tgt = null; roundT = now; inSince = 0; }
+function onLongBlink(now){
+  if (mode !== "play") return;
+  logLine(`long_blink,${new Date().toISOString()},phase=${phase}`);
+  if (phase === "carry"){ phase = "seek"; roundT = now; inSince = 0; tgt = null; }   // drop the circle where it is
+  else newRound(now);                                                               // skip to a new circle
+}
+function stepPlay(now){
+  if (!gaze || now - gaze.t > 300) { inSince = 0; return; }
+  if (phase === "seek"){
+    // implicit calibration: 0.5 s after a circle appears, a steady gaze is (almost always) on it -> learn
+    if (feat && steady && now - roundT > 500){ LIVE.push({ f: feat, x: circ.x, y: circ.y }); if (LIVE.length > 400) LIVE.shift();
+      if (++sinceFit >= 15) refit(); }
+    const inside = Math.hypot(gaze.x - circ.x, gaze.y - circ.y) < R();
+    if (inside){ if (!inSince) inSince = now;
+      if (now - inSince > HOLD){ locks++; $("hLocks").textContent = locks; buzz(1);
+        logLine(`lock,${new Date().toISOString()},ms_to_lock=${Math.round(now-roundT)},learned=${LIVE.length}`);
+        phase = "carry"; tgt = randPos(circ); inSince = 0; roundT = now; } }
+    else inSince = 0;
+  } else if (phase === "carry"){
+    circ.x += (gaze.x - circ.x)*0.18; circ.y += (gaze.y - circ.y)*0.18;    // the circle rides on your gaze
+    const inside = Math.hypot(circ.x - tgt.x, circ.y - tgt.y) < R()*0.6;
+    if (inside){ if (!inSince) inSince = now;
+      if (now - inSince > HOLD){ moves++; $("hMoves").textContent = moves; buzz(2); okFlash = now;
+        logLine(`move,${new Date().toISOString()},ms_to_carry=${Math.round(now-roundT)}`); newRound(now); } }
+    else inSince = 0;
+  }
+}
+
+// ---------------------------------------------------------------- feedback + drawing
+function tone(f, dur, vol){ try { if (!audio) return; const o = audio.createOscillator(), g = audio.createGain();
+  o.frequency.value = f; g.gain.setValueAtTime(0.0001, audio.currentTime); g.gain.exponentialRampToValueAtTime(vol, audio.currentTime+0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, audio.currentTime+dur); o.connect(g).connect(audio.destination); o.start(); o.stop(audio.currentTime+dur+0.05); } catch(e){} }
+function buzz(k){ try { navigator.vibrate && navigator.vibrate(k === 2 ? [40,40,90] : 50); } catch(e){}
+  if (k === 2){ tone(660,0.3,0.2); setTimeout(()=>tone(990,0.4,0.2),140); } else tone(520,0.25,0.18); }
+function ring(x, y, r, col, w, dash){ ctx.strokeStyle = col; ctx.lineWidth = w; ctx.setLineDash(dash||[]); ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.stroke(); ctx.setLineDash([]); }
+function drawPlay(now){
+  bg(); const r = R();
+  if (tgt){ ring(tgt.x, tgt.y, r*1.05, "#d8ffe8", 3, [8,8]); ctx.fillStyle = "#a9d9bd"; ctx.font = "14px system-ui"; ctx.textAlign = "center"; ctx.fillText("bring it here", tgt.x, tgt.y + 5); }
+  const hold = inSince ? Math.min(1, (now - inSince)/HOLD) : 0, carrying = phase === "carry";
+  ctx.save(); ctx.shadowColor = "#7dffb0"; ctx.shadowBlur = carrying ? 30 : 10 + 30*hold;
+  ctx.fillStyle = `rgba(125,255,176,${carrying ? 0.35 : 0.10 + 0.25*hold})`; ctx.beginPath(); ctx.arc(circ.x, circ.y, r, 0, 7); ctx.fill(); ctx.restore();
+  ring(circ.x, circ.y, r, "#7dffb0", carrying ? 5 : 3);
+  if (hold > 0){ ctx.strokeStyle = "#d8ffe8"; ctx.lineWidth = 5; ctx.beginPath(); ctx.arc(circ.x, circ.y, r + 9, -Math.PI/2, -Math.PI/2 + hold*2*Math.PI); ctx.stroke(); }
+  if (okFlash && now - okFlash < 500){ ring(W/2, H/2, M*0.2 + (now-okFlash)*0.6, `rgba(125,255,176,${1-(now-okFlash)/500})`, 4); }
+  // the red dot: where the phone sees your eyes looking
+  const blinkNow = face && !eyesOpen, flash = now - blinkFlash < 250;
+  if (gaze){ const inside = Math.hypot(gaze.x - circ.x, gaze.y - circ.y) < r;
+    const col = blinkNow || flash ? "#ffffff" : (inside ? "#7dffb0" : "#ff4d4d");
+    ctx.save(); ctx.shadowColor = col; ctx.shadowBlur = 16; ctx.fillStyle = col;
+    ctx.beginPath(); ctx.arc(gaze.x, gaze.y, blinkNow ? 13 : 10, 0, 7); ctx.fill(); ctx.restore(); }
+  ctx.font = "15px system-ui"; ctx.textAlign = "center";
+  const msg = !face ? ["#ff4d4d","Face not found — more light"] : blinkNow ? ["#ffffff", blinkStart && now-blinkStart > 400 ? "Long blink…" : "Blink"]
+    : carrying ? ["#7dffb0","LOCKED — carry it to the ring with your eyes"] : ["#a9d9bd","Get the red dot into the green circle"];
+  ctx.fillStyle = msg[0]; ctx.fillText(msg[1], W/2, (opt.light ? Math.max(28, M*0.09) : 0) + 70);
+}
+
+let lastT = 0;
+function loop(now){ track(now);
+  if (mode === "cal") stepCal(now); else if (mode === "play"){ stepPlay(now); drawPlay(now); }
+  requestAnimationFrame(loop); }
+requestAnimationFrame(loop);
+
+// ---------------------------------------------------------------- log + UI
+const LOG = ["kind,time,detail..."];
+function logLine(s){ LOG.push(s); $("log").textContent = LOG.join("\n"); }
+function showStart(){ mode = "idle"; $("pStart").classList.remove("hidden"); $("bStart").disabled = false; }
+$("bStart").onclick = async () => {
+  opt.light = $("optLight").checked; $("bStart").disabled = true;
+  try { audio = audio || new (window.AudioContext || window.webkitAudioContext)(); } catch(e){}
+  try { if (!landmarker) await boot(); }
+  catch(e){ status("Could not start camera/model: " + (e && e.message || e) + ". Open from an https address in Chrome and allow the camera."); $("bStart").disabled = false; return; }
+  $("menuBtn").style.display = "block"; $("pStart").classList.add("hidden"); startCal();
+};
+$("menuBtn").onclick = () => { if (mode === "play") mode = "paused"; $("pMenu").classList.remove("hidden"); $("log").textContent = LOG.join("\n"); };
+$("bResume").onclick = () => { $("pMenu").classList.add("hidden"); if (mapX){ mode = "play"; newRound(performance.now()); } else startCal(); };
+$("bRecal").onclick = () => { $("pMenu").classList.add("hidden"); startCal(); };
+$("bCopy").onclick = async () => { try { await navigator.clipboard.writeText(LOG.join("\n")); $("copyMsg").textContent = "Copied."; }
+  catch(e){ $("copyMsg").textContent = "Copy blocked — long-press the log above to select it."; } };
+}
+</script>
+</body>
+</html>

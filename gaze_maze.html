@@ -14,7 +14,7 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);
   font:16px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;overflow:hidden;touch-action:none}
 canvas#stage{position:fixed;inset:0;width:100vw;height:100vh;display:block}
 #hud{position:fixed;left:0;right:0;bottom:0;padding:10px 14px calc(10px + env(safe-area-inset-bottom));
-  display:flex;gap:14px;justify-content:space-between;font-size:14px;color:var(--g2);pointer-events:none}
+  display:flex;gap:14px;justify-content:space-between;font-size:14px;color:var(--g2);pointer-events:none;background:rgba(5,10,8,.92)}
 #hud b{color:var(--g1);font-weight:600}
 #cam{position:fixed;top:10px;right:10px;width:72px;height:96px;object-fit:cover;border-radius:10px;
   border:1px solid var(--g3);transform:scaleX(-1);opacity:.55;display:none}
@@ -49,6 +49,7 @@ pre#log{max-height:30vh;overflow:auto;text-align:left;font-size:12px;background:
   <div class="row">
     <label>Step speed
       <select id="optSpeed"><option value="600">Calm</option><option value="420" selected>Normal</option><option value="300">Fast</option></select></label>
+    <label><input type="checkbox" id="optLight" checked> Screen light (for dim rooms)</label>
     <label><input type="checkbox" id="optDot"> Show gaze dot</label>
     <label><input type="checkbox" id="optCam"> Show camera</label>
   </div>
@@ -79,7 +80,7 @@ function resize(){ DPR = Math.min(devicePixelRatio || 1, 2); W = innerWidth; H =
   cv.width = W*DPR; cv.height = H*DPR; ctx.setTransform(DPR,0,0,DPR,0,0); CX = W/2; CY = H*0.47; M = Math.min(W,H); }
 addEventListener("resize", resize); resize();
 const status = msg => { $("status").textContent = msg; };
-const opt = { speed:420, dot:false, cam:false };
+const opt = { speed:420, dot:false, cam:false, light:true };
 let landmarker = null, audio = null;
 
 // ---------------------------------------------------------------- gaze features (same engine as Thought Pull)
@@ -129,48 +130,71 @@ async function boot(){
   const stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:"user", width:{ideal:640}, height:{ideal:480} }, audio:false });
   vid.srcObject = stream; await vid.play();
 }
-let lastVT = -1, feat = null, gaze = null;
+let lastVT = -1, feat = null, gaze = null, steady = false;
+// v1.2 eye-lock: the eyes count as "locked" when both irises are found and have held still for ~8 frames
+// v1.3: 0.02 was far too strict on Barry's phone (stuck on amber). Start at 0.05 and relax automatically
+// by x1.4 for every 1.5 s spent on a dot without a lock (cap 0.15); the value used is logged for tuning.
+const HIST = []; let STEADY_TOL = 0.05;
+function updSteady(){ if (!feat){ HIST.length = 0; steady = false; return; }
+  HIST.push([(feat[1]+feat[3])/2, (feat[2]+feat[4])/2]); if (HIST.length > 8) HIST.shift();
+  if (HIST.length < 6){ steady = false; return; }
+  const sd = j => { const m = HIST.reduce((a,h)=>a+h[j],0)/HIST.length; return Math.sqrt(HIST.reduce((a,h)=>a+(h[j]-m)**2,0)/HIST.length); };
+  steady = Math.max(sd(0), sd(1)) < STEADY_TOL; }
 function track(now){
   if (landmarker && vid.readyState >= 2 && vid.currentTime !== lastVT){
-    lastVT = vid.currentTime; feat = features(landmarker.detectForVideo(vid, now));
+    lastVT = vid.currentTime; feat = features(landmarker.detectForVideo(vid, now)); updSteady();
     if (feat && mapX) gaze = { x: fX(mapX(feat), now), y: fY(mapY(feat), now), t: now };
   }
 }
 
+// screen light: a bright frame round the screen lights the face like a selfie flash (v1.1: added after
+// Barry found it would not track in a dark room -- the front camera is a normal camera, it needs light)
+function bg(){ ctx.fillStyle = "#050a08"; ctx.fillRect(0,0,W,H);
+  if (!opt.light) return; const t = Math.max(28, M*0.09);
+  ctx.strokeStyle = "#f4fff8"; ctx.lineWidth = 2*t; ctx.strokeRect(0, 0, W, H); }
 // ---------------------------------------------------------------- calibration (dwell, no taps)
 let mode = "idle", cal = null, accPx = NaN;
-function startCal(){ const P=[]; for (const y of [.12,.47,.82]) for (const x of [.12,.5,.88]) P.push({x:x*W,y:y*H});
+function startCal(){ const P=[]; for (const y of [.12,.47,.82]) for (const x of [.18,.5,.82]) P.push({x:x*W,y:y*H});
   cal = { pts: P.sort(()=>Math.random()-.5), i:0, t0: performance.now(), X:[], Yx:[], Yy:[], phase:"cal", val:[] };
   mode = "cal"; mapX = mapY = null; fX = oneEuro(); fY = oneEuro(); }
-const SETTLE = 700, COLLECT = 1100;
+const SETTLE = 600, NEED = 20, TIMEOUT = 3500;
 function stepCal(now){
   const p = cal.pts[cal.i], el = now - cal.t0;
-  if (el > SETTLE && feat){
-    if (cal.phase === "cal"){ cal.X.push(feat); cal.Yx.push(p.x); cal.Yy.push(p.y); }
-    else if (gaze) cal.val.push(Math.hypot(gaze.x-p.x, gaze.y-p.y));
+  if (cal.n === undefined) cal.n = 0;
+  if (cal.n === 0 && el > SETTLE + 1500*(cal.relax||1) && STEADY_TOL < 0.15){ STEADY_TOL = Math.min(0.15, STEADY_TOL*1.4); cal.relax = (cal.relax||1) + 1; }
+  if (el > SETTLE && feat && steady){
+    if (cal.phase === "cal"){ cal.X.push(feat); cal.Yx.push(p.x); cal.Yy.push(p.y); cal.n++; }
+    else if (gaze){ cal.val.push(Math.hypot(gaze.x-p.x, gaze.y-p.y)); cal.n++; }
   }
-  if (el > SETTLE + COLLECT){
-    cal.i++; cal.t0 = now;
+  if (cal.n >= NEED || el > SETTLE + TIMEOUT){
+    if (cal.n < NEED) cal.weak = (cal.weak||0) + 1;
+    cal.i++; cal.t0 = now; cal.n = 0; cal.relax = 1;
     if (cal.i >= cal.pts.length){
       if (cal.phase === "cal"){
         if (cal.X.length < 60){ status("Face not found often enough — check lighting and try again."); mode="idle"; $("pStart").classList.remove("hidden"); $("bStart").disabled=false; return; }
         mapX = fitRidge(cal.X, cal.Yx); mapY = fitRidge(cal.X, cal.Yy);
-        cal.phase = "val"; cal.i = 0; cal.pts = [{x:.5*W,y:.12*H},{x:.88*W,y:.47*H},{x:.5*W,y:.82*H},{x:.12*W,y:.47*H}];
+        cal.phase = "val"; cal.i = 0; cal.pts = [{x:.5*W,y:.12*H},{x:.82*W,y:.47*H},{x:.5*W,y:.82*H},{x:.18*W,y:.47*H}];
       } else {
         cal.val.sort((a,b)=>a-b); accPx = cal.val.length ? cal.val[Math.floor(cal.val.length/2)] : NaN;
         $("hAcc").textContent = isFinite(accPx) ? `±${Math.round(accPx)} px` : "";
-        logLine(`calibration,${new Date().toISOString()},median_val_err_px=${Math.round(accPx)},screen=${W}x${H}`);
+        logLine(`calibration,${new Date().toISOString()},median_val_err_px=${Math.round(accPx)},dots_timed_out=${cal.weak||0},steady_tol=${STEADY_TOL.toFixed(3)},screen=${W}x${H}`);
         if (!maze) newMaze(); mode = "play";
       }
     }
   }
-  ctx.fillStyle = "#050a08"; ctx.fillRect(0,0,W,H);
-  const q = cal.pts[cal.i]; if (!q) return; const k = Math.min(1, el/SETTLE);
-  ctx.strokeStyle = "#3ea874"; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(q.x, q.y, 26-14*k, 0, 7); ctx.stroke();
-  ctx.fillStyle = el > SETTLE ? "#7dffb0" : "#3ea874"; ctx.beginPath(); ctx.arc(q.x, q.y, 6, 0, 7); ctx.fill();
+  bg();
+  const q = cal.pts[cal.i]; if (!q) return;
+  const st = !feat ? 0 : (steady && el > SETTLE ? 2 : 1);            // 0 no eyes, 1 eyes moving, 2 LOCKED
+  const col = ["#ff6b5a", "#ffc861", "#7dffb0"][st], prog = Math.min(1, cal.n / NEED);
+  ctx.save();
+  if (st === 2){ ctx.shadowColor = "#7dffb0"; ctx.shadowBlur = 18 + 18*Math.sin(now/120)**2; }
+  ctx.fillStyle = col; ctx.beginPath(); ctx.arc(q.x, q.y, st === 2 ? 10 : 7, 0, 7); ctx.fill(); ctx.restore();
+  ctx.strokeStyle = "rgba(62,168,116,.45)"; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(q.x, q.y, 22, 0, 7); ctx.stroke();
+  ctx.strokeStyle = col; ctx.lineWidth = 4; ctx.beginPath(); ctx.arc(q.x, q.y, 22, -Math.PI/2, -Math.PI/2 + prog*2*Math.PI); ctx.stroke();
   ctx.fillStyle = "#a9d9bd"; ctx.font = "15px system-ui"; ctx.textAlign = "center";
-  ctx.fillText(cal.phase === "cal" ? `Look at the dot · ${cal.i+1}/${cal.pts.length}` : `Checking accuracy · ${cal.i+1}/4`, W/2, H*0.95);
-  if (!feat){ ctx.fillStyle = "#ff6b5a"; ctx.fillText("Face / eyes not detected", W/2, H*0.98); }
+  ctx.fillText(cal.phase === "cal" ? `Look at the dot · ${cal.i+1}/${cal.pts.length}` : `Checking accuracy · ${cal.i+1}/4`, W/2, H*0.27);
+  ctx.fillStyle = col;
+  ctx.fillText(["Eyes not found — more light, face the screen", "Eyes found — hold still on the dot", "Locked ✓"][st], W/2, H*0.31);
 }
 
 // ---------------------------------------------------------------- maze (recursive backtracker) + BFS shortest path
@@ -223,8 +247,9 @@ function buzz(k){ try { navigator.vibrate && navigator.vibrate(k === "win" ? [40
 
 // ---------------------------------------------------------------- drawing
 function drawPlay(now){
-  ctx.fillStyle = "#050a08"; ctx.fillRect(0,0,W,H);
-  const n = maze.n, S = Math.min(W*0.78, H*0.56), cs = S/n, ox = CX - S/2, oy = CY - S/2;
+  bg();
+  const fr = opt.light ? Math.max(28, M*0.09) : 0;
+  const n = maze.n, S = Math.min(W*0.78, W - 2*(fr + 46), H*0.56), cs = S/n, ox = CX - S/2, oy = CY - S/2;
   // trail
   ctx.fillStyle = "rgba(62,168,116,.16)";
   for (const c of trail) ctx.fillRect(ox + (c%n)*cs + cs*0.2, oy + ((c/n)|0)*cs + cs*0.2, cs*0.6, cs*0.6);
@@ -245,7 +270,7 @@ function drawPlay(now){
   ctx.save(); ctx.shadowColor = "#7dffb0"; ctx.shadowBlur = 18 + 40*won; ctx.fillStyle = "#7dffb0";
   ctx.beginPath(); ctx.arc(ox + runner.px, oy + runner.py, cs*0.3*(1+won), 0, 7); ctx.fill(); ctx.restore();
   // direction pads at the four edges, filling as dwell builds
-  const pads = [ {x:CX, y:Math.max(46, oy-48)}, {x:W-30, y:CY}, {x:CX, y:Math.min(H-70, oy+S+48)}, {x:30, y:CY} ];
+  const pads = [ {x:CX, y:Math.max(fr+30, oy-48)}, {x:W-fr-26, y:CY}, {x:CX, y:Math.min(H-fr-70, oy+S+48)}, {x:fr+26, y:CY} ];
   pads.forEach((p,i)=>{ const active = i === dirIdx, fill = active ? Math.min(1,(now-dirSince)/opt.speed) : 0;
     const hit = i === bumpDir && now - bump < 300;
     ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(i*Math.PI/2);
@@ -271,7 +296,7 @@ requestAnimationFrame(loop);
 const LOG = ["kind,time,detail..."];
 function logLine(s){ LOG.push(s); $("log").textContent = LOG.join("\n"); }
 $("bStart").onclick = async () => {
-  opt.speed = +$("optSpeed").value; opt.dot = $("optDot").checked; opt.cam = $("optCam").checked; $("bStart").disabled = true;
+  opt.speed = +$("optSpeed").value; opt.light = $("optLight").checked; opt.dot = $("optDot").checked; opt.cam = $("optCam").checked; $("bStart").disabled = true;
   try { audio = audio || new (window.AudioContext || window.webkitAudioContext)(); } catch(e){}
   try { if (!landmarker) await boot(); }
   catch(e){ status("Could not start camera/model: " + (e && e.message || e) + ". Open from an https address in Chrome and allow the camera."); $("bStart").disabled = false; return; }
